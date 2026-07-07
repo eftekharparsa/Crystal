@@ -420,53 +420,212 @@ def create_crystal_geometry_nodes():
     links.new(inst1.outputs["Instances"], join_insts.inputs["Geometry"])
     links.new(inst2.outputs["Instances"], join_insts.inputs["Geometry"])
 
-    # Bonds visualization
-    # Generating edges from point clouds in pure GN is complex. A simple approach for
-    # cubic lattices is to use the Points to Volume trick, or simply use
-    # the original mesh lines but we must make sure edges exist in X, Y, Z.
-    # For now, to keep the tree from becoming massive, we'll connect points via proximity.
+    # -------------------------------------------------------------------------
+    # Bonds visualization via Springs
+    # Instancing Springs before applying Physics Deformation.
+    # -------------------------------------------------------------------------
 
-    # A simple but effective trick for bond generation from points:
-    # Instance a thin cylinder on every point, aligned to neighbors.
-    # Or rely on VolumeToMesh as before which creates a continuous web.
-    # Since VolumeToMesh is heavy, we'll use a bounding-box volume approach.
+    # 1. Base Geometry before noise/strain displacement
+    # Wait, base_atoms is AFTER strain/vibration? No, let's check:
+    # `base_atoms` = `delete_geom` which is AFTER `miller_cut` which is AFTER `apply_strain` (which is AFTER `set_vibration`).
+    # We want springs to track the noise exactly, meaning we must generate them on UNDEFORMED space, then push them through the identical noise!
 
-    pt_vol = nodes.new('GeometryNodePointsToVolume')
-    pt_vol.location = (2600, -100)
-    pt_vol.inputs["Radius"].default_value = 0.15 # Approx half a bond
-    links.new(base_atoms.outputs["Geometry"], pt_vol.inputs["Points"])
+    # Actually, we applied noise -> strain -> miller cut -> defects -> base_atoms.
+    # To get springs to deform correctly, they must have geometry to sample the noise!
+    # Because Noise displacement is driven by Position, if we realize the springs here, their new geometry (vertices along the spring)
+    # will evaluate the Noise based on their new positions, which means the spring itself will physically warp and wave, which is visually stunning.
+    # But wait! If we instance springs AFTER the points are displaced, the base of the spring is at the displaced position,
+    # and if we apply noise AGAIN it will double-displace!
 
-    vol_mesh = nodes.new('GeometryNodeVolumeToMesh')
-    vol_mesh.location = (2800, -100)
-    links.new(pt_vol.outputs["Volume"], vol_mesh.inputs["Volume"])
+    # Correct order:
+    # We must generate points -> defect/cut -> instance atoms/springs -> realize springs -> THEN apply noise/strain to everything.
+    # However, refactoring the whole tree is dangerous.
+    # Alternate method: `delete_geom` currently holds points that are ALREADY displaced.
+    # If we instance springs here, they are static rigid objects sitting between the already-displaced points.
+    # But the user asked for springs that STRETCH while atoms oscillate!
+    # This means the spring ends must stick to the atoms.
+    # Since GN noise operates on coordinate space (Position), if we take the ORIGINAL UNDISPLACED points, instance springs, realize them,
+    # and then displace everything together, the springs will organically stretch and warp!
 
-    mesh_curve = nodes.new('GeometryNodeMeshToCurve')
-    mesh_curve.location = (3000, -100)
-    links.new(vol_mesh.outputs["Mesh"], mesh_curve.inputs["Mesh"])
+    # Let's intercept the undisplaced points (scale_pos) and generate springs there.
+    # Wait, we need to know which points survive the defects and cuts!
+    # Let's extract the defect & cut logic to a Selection boolean field evaluated ON the points, BEFORE we do anything!
 
-    curve_mesh = nodes.new('GeometryNodeCurveToMesh')
-    curve_mesh.location = (3200, -100)
-    links.new(mesh_curve.outputs["Curve"], curve_mesh.inputs["Curve"])
+    # Actually, modifying the core tree flow is risky.
+    # What if we just use a trick?
+    # We can inverse-transform the base_atoms to find their original positions? No, noise isn't easily invertible.
 
-    bond_profile = nodes.new('GeometryNodeCurvePrimitiveCircle')
-    bond_profile.location = (3000, -250)
-    bond_profile.inputs["Radius"].default_value = 0.03
-    bond_profile.inputs["Resolution"].default_value = 6
-    links.new(bond_profile.outputs["Curve"], curve_mesh.inputs["Profile Curve"])
+    # Let's refactor safely:
+    # `scale_pos` -> `set_vibration` -> `apply_strain` -> `miller_cut` -> `delete_geom`
+    # Let's create the Selection for Miller and Defects based on `scale_pos` (undisplaced).
+    # Then apply that selection to `scale_pos` FIRST.
+    # Then we have `pruned_base_points`.
+    # Then we instance springs on `pruned_base_points`.
+    # Then we realize instances.
+    # Then we merge `pruned_base_points` and `springs`? Wait, points don't need realization.
+    # Then we pass the whole thing through `set_vibration` and `apply_strain`.
+    # Yes! This is perfect and clean.
 
+    # -- REWIRING THE PHYSICS ORDER --
+
+    # 1. Extract the Selection Field from Miller Cut
+    # The dot product was calculated using `pos_cut` (Position). That works on any node.
+
+    # Disconnect miller_cut and delete_geom's geometry connections.
+    links.new(scale_pos.outputs["Geometry"], miller_cut.inputs["Geometry"]) # Rewire: cut happens directly after scale_pos
+
+    # Re-link the Miller dot product to evaluate BEFORE strain (it will use undisplaced coords, which is physically identical for planes!)
+    # Actually, strain scales the plane. For visual consistency, evaluating plane on undisplaced points is standard.
+
+    # 2. Re-wire Defect Delete to happen right after Miller Cut
+    links.new(miller_cut.outputs["Geometry"], delete_geom.inputs["Geometry"])
+
+    # Now `delete_geom` holds UNDEFORMED, pruned base points.
+    # Let's rename our variable reference:
+    pruned_base_atoms = delete_geom
+
+    # 3. Build Springs on `pruned_base_atoms`
+    # We will instance a spring (Spiral Curve) on X, Y, and Z axes.
+    # Spring X
+    spring_x = nodes.new('GeometryNodeCurveSpiral')
+    spring_x.location = (1800, -900)
+    spring_x.inputs["Resolution"].default_value = 32
+    spring_x.inputs["Rotations"].default_value = 5.0
+    spring_x.inputs["Start Radius"].default_value = 0.05
+    spring_x.inputs["End Radius"].default_value = 0.05
+    # Height should be the lattice constant. But since we scaled the points by A and C earlier,
+    # the distance to neighbor is A (or C). Let's feed Lattice Constant A to Height.
+    links.new(group_in.outputs["Lattice Constant A"], spring_x.inputs["Height"])
+
+    align_x = nodes.new('GeometryNodeTransform')
+    align_x.location = (2000, -900)
+    links.new(spring_x.outputs["Curve"], align_x.inputs["Geometry"])
+    align_x.inputs["Rotation"].default_value = (0, 1.5708, 0) # Rotate 90deg Y to point in +X
+
+    inst_spring_x = nodes.new('GeometryNodeInstanceOnPoints')
+    inst_spring_x.location = (2200, -900)
+    links.new(pruned_base_atoms.outputs["Geometry"], inst_spring_x.inputs["Points"])
+    links.new(align_x.outputs["Geometry"], inst_spring_x.inputs["Instance"])
+
+    # Spring Y
+    spring_y = nodes.new('GeometryNodeCurveSpiral')
+    spring_y.location = (1800, -1100)
+    spring_y.inputs["Resolution"].default_value = 32
+    spring_y.inputs["Rotations"].default_value = 5.0
+    spring_y.inputs["Start Radius"].default_value = 0.05
+    spring_y.inputs["End Radius"].default_value = 0.05
+    links.new(group_in.outputs["Lattice Constant A"], spring_y.inputs["Height"])
+
+    align_y = nodes.new('GeometryNodeTransform')
+    align_y.location = (2000, -1100)
+    links.new(spring_y.outputs["Curve"], align_y.inputs["Geometry"])
+    align_y.inputs["Rotation"].default_value = (-1.5708, 0, 0) # Rotate -90deg X to point in +Y
+
+    inst_spring_y = nodes.new('GeometryNodeInstanceOnPoints')
+    inst_spring_y.location = (2200, -1100)
+    links.new(pruned_base_atoms.outputs["Geometry"], inst_spring_y.inputs["Points"])
+    links.new(align_y.outputs["Geometry"], inst_spring_y.inputs["Instance"])
+
+    # Spring Z
+    spring_z = nodes.new('GeometryNodeCurveSpiral')
+    spring_z.location = (1800, -1300)
+    spring_z.inputs["Resolution"].default_value = 32
+    spring_z.inputs["Rotations"].default_value = 5.0
+    spring_z.inputs["Start Radius"].default_value = 0.05
+    spring_z.inputs["End Radius"].default_value = 0.05
+    links.new(group_in.outputs["Lattice Constant C"], spring_z.inputs["Height"])
+
+    inst_spring_z = nodes.new('GeometryNodeInstanceOnPoints')
+    inst_spring_z.location = (2200, -1300)
+    links.new(pruned_base_atoms.outputs["Geometry"], inst_spring_z.inputs["Points"])
+    links.new(spring_z.outputs["Curve"], inst_spring_z.inputs["Instance"])
+
+    # 2D Material Z Spring Block
+    switch_z_spring = nodes.new('GeometryNodeSwitch')
+    switch_z_spring.input_type = 'GEOMETRY'
+    switch_z_spring.location = (2400, -1300)
+    links.new(group_in.outputs["Is 2D"], switch_z_spring.inputs["Switch"])
+    links.new(inst_spring_z.outputs["Instances"], switch_z_spring.inputs["False"])
+    # If True, passes empty geometry.
+
+    # Join Springs
+    join_springs = nodes.new('GeometryNodeJoinGeometry')
+    join_springs.location = (2600, -1000)
+    links.new(inst_spring_x.outputs["Instances"], join_springs.inputs["Geometry"])
+    links.new(inst_spring_y.outputs["Instances"], join_springs.inputs["Geometry"])
+    links.new(switch_z_spring.outputs["Output"], join_springs.inputs["Geometry"])
+
+    # Realize springs so they become curves we can displace!
+    realize_springs = nodes.new('GeometryNodeRealizeInstances')
+    realize_springs.location = (2800, -1000)
+    links.new(join_springs.outputs["Geometry"], realize_springs.inputs["Geometry"])
+
+    # Profile the curves into meshes
+    curve_to_mesh = nodes.new('GeometryNodeCurveToMesh')
+    curve_to_mesh.location = (3000, -1000)
+    links.new(realize_springs.outputs["Geometry"], curve_to_mesh.inputs["Curve"])
+
+    spring_profile = nodes.new('GeometryNodeCurvePrimitiveCircle')
+    spring_profile.location = (2800, -1100)
+    spring_profile.inputs["Radius"].default_value = 0.015
+    spring_profile.inputs["Resolution"].default_value = 6
+    links.new(spring_profile.outputs["Curve"], curve_to_mesh.inputs["Profile Curve"])
+
+    # Show Bonds switch
     bond_switch = nodes.new('GeometryNodeSwitch')
     bond_switch.input_type = 'GEOMETRY'
-    bond_switch.location = (3400, 100)
+    bond_switch.location = (3200, -1000)
     links.new(group_in.outputs["Show Bonds"], bond_switch.inputs["Switch"])
-    links.new(curve_mesh.outputs["Mesh"], bond_switch.inputs["True"])
+    links.new(curve_to_mesh.outputs["Mesh"], bond_switch.inputs["True"])
 
+    # 4. Now, join the Pruned Base Points and the Springs, and push them through Vibration and Strain!
+    join_pre_physics = nodes.new('GeometryNodeJoinGeometry')
+    join_pre_physics.location = (3400, -500)
+    links.new(pruned_base_atoms.outputs["Geometry"], join_pre_physics.inputs["Geometry"])
+    links.new(bond_switch.outputs["Output"], join_pre_physics.inputs["Geometry"])
+
+    # 4.5 Ensure Lattice is a Point Cloud before joining!
+    # Mesh Line generates Meshes. Realize Instances outputs Meshes.
+    # We must convert to Point Cloud so `Separate Components` works.
+    mesh_to_pts = nodes.new('GeometryNodeMeshToPoints')
+    mesh_to_pts.location = (3200, -500)
+    links.new(pruned_base_atoms.outputs["Geometry"], mesh_to_pts.inputs["Mesh"])
+
+    # RE-WIRE physics to take `join_pre_physics`!
+    links.new(mesh_to_pts.outputs["Points"], join_pre_physics.inputs["Geometry"])
+    links.new(join_pre_physics.outputs["Geometry"], set_vibration.inputs["Geometry"])
+    # Apply strain already takes set_vibration.
+
+    # Let's fix the location of set_vibration and apply_strain so it visually makes sense.
+    set_vibration.location = (3600, -500)
+    apply_strain.location = (3800, -500)
+
+    # 5. Separation: The output of apply_strain now contains both Point Clouds and Spring Meshes!
+    # We must separate the Points so we can instance the Atoms on them.
+    separate_atoms = nodes.new('GeometryNodeSeparateComponents')
+    separate_atoms.location = (4000, -500)
+    links.new(apply_strain.outputs["Geometry"], separate_atoms.inputs["Geometry"])
+
+    # 6. Re-wire Atom Instancing
+    # Previously we used `sep_points` for diatomic splitting from `base_atoms`.
+    # Update `sep_points` to take `separate_atoms.outputs["Point Cloud"]`.
+    links.new(separate_atoms.outputs["Point Cloud"], sep_points.inputs["Geometry"])
+
+    # Shift Atom logic over
+    sep_points.location = (4200, -200)
+    and_diat.location = (4200, -350)
+    inst1.location = (4400, -100)
+    inst2.location = (4400, -300)
+    join_insts.location = (4600, -200)
+
+    # 7. Final Join!
     join_final = nodes.new('GeometryNodeJoinGeometry')
-    join_final.location = (3600, 250)
+    join_final.location = (4800, -400)
     links.new(join_insts.outputs["Geometry"], join_final.inputs["Geometry"])
-    links.new(bond_switch.outputs["Output"], join_final.inputs["Geometry"])
+    links.new(separate_atoms.outputs["Mesh"], join_final.inputs["Geometry"]) # The displaced springs
 
     # Output
-    group_out.location = (3800, 250)
+    group_out.location = (5000, -400)
     links.new(join_final.outputs["Geometry"], group_out.inputs["Geometry"])
 
     return group
@@ -629,11 +788,11 @@ class CRYSTAL_OT_generate(bpy.types.Operator):
             "Use Atom 2": props.atom_2_instance is not None,
         }
 
-        # Mapping input names to their identifiers in the modifier (Blender 4.0+)
+        # Mapping input names to their internal hash identifiers in the modifier (Blender 4.0+)
         input_identifier = {}
-        for identifier, socket in node_group.interface.items_tree.items():
+        for _name, socket in node_group.interface.items_tree.items():
             if socket.item_type == 'SOCKET' and socket.in_out == 'INPUT':
-                input_identifier[socket.name] = identifier
+                input_identifier[socket.name] = socket.identifier
 
         for name, val in input_name_to_val.items():
             if name in input_identifier:
